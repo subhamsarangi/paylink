@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, Form, Depends, Response
+from fastapi import FastAPI, HTTPException, Request, Form, Depends
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -125,28 +125,6 @@ class RateLimitMiddleware:
 
 app.add_middleware(RateLimitMiddleware, rate_limit=10, time_window=60)
 
-# Content Security Policy Middleware using separate lists for allowed URLs
-allowed_script_sources = [
-    "'self'",
-    "https://js.stripe.com",
-    "https://cdn.jsdelivr.net",
-    "https://code.jquery.com",
-]
-allowed_style_sources = [
-    "'self'",
-    "'unsafe-inline'",
-    "https://cdn.jsdelivr.net",
-    "https://fonts.googleapis.com",
-]
-allowed_font_sources = [
-    "'self'",
-    "https://js.stripe.com",
-    "https://cdn.jsdelivr.net",
-    "https://fonts.gstatic.com",
-    "data:",
-]
-allowed_img_sources = ["'self'", "data:"]
-
 
 class ContentSecurityPolicyMiddleware:
     def __init__(self, app):
@@ -156,14 +134,17 @@ class ContentSecurityPolicyMiddleware:
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
                 csp = (
-                    f"default-src 'self'; "
-                    f"script-src {' '.join(allowed_script_sources)}; "
-                    f"style-src {' '.join(allowed_style_sources)}; "
-                    f"font-src {' '.join(allowed_font_sources)}; "
-                    f"img-src {' '.join(allowed_img_sources)};"
+                    "default-src 'self'; "
+                    "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; "
+                    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+                    "font-src 'self' data:; "
+                    "img-src 'self' data: https://fastapi.tiangolo.com;"
                 )
                 message.setdefault("headers", [])
-                message["headers"].append((b"content-security-policy", csp.encode()))
+                message["headers"].append(
+                    (b"content-security-policy", csp.encode("utf-8"))
+                )
+
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
@@ -381,3 +362,97 @@ async def cleanup_expired(db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=500, detail=f"Error cleaning up expired links: {e}"
         )
+
+
+@app.get("/payments")
+async def list_payments(
+    page: int = 1,
+    per_page: int = 10,
+    order_id: Optional[str] = None,
+    email: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        query = db.query(PaymentLink)
+        if order_id:
+            query = query.filter(PaymentLink.order_id.like(f"%{order_id}%"))
+        if email:
+            query = query.filter(PaymentLink.email.like(f"%{email}%"))
+        if status:
+            query = query.filter(PaymentLink.status == status)
+
+        total = query.count()
+        payments = (
+            query.order_by(PaymentLink.created_at.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        results = []
+        for payment in payments:
+            results.append(
+                {
+                    "id": payment.id,
+                    "token": payment.token,
+                    "order_id": payment.order_id,
+                    "email": payment.email,
+                    "amount": payment.amount,
+                    "created_at": payment.created_at.isoformat(),
+                    "status": payment.status,
+                }
+            )
+
+        return {"page": page, "per_page": per_page, "total": total, "data": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving payments: {e}")
+
+
+@app.get("/payments/export")
+async def export_payments_csv(
+    order_id: Optional[str] = None,
+    email: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        import csv
+        from io import StringIO
+
+        query = db.query(PaymentLink)
+        if order_id:
+            query = query.filter(PaymentLink.order_id.like(f"%{order_id}%"))
+        if email:
+            query = query.filter(PaymentLink.email.like(f"%{email}%"))
+        if status:
+            query = query.filter(PaymentLink.status == status)
+
+        payments = query.order_by(PaymentLink.created_at.desc()).all()
+
+        si = StringIO()
+        writer = csv.writer(si)
+
+        writer.writerow(
+            ["ID", "Token", "Order ID", "Email", "Amount", "Created At", "Status"]
+        )
+
+        for payment in payments:
+            writer.writerow(
+                [
+                    payment.id,
+                    payment.token,
+                    payment.order_id,
+                    payment.email,
+                    payment.amount,
+                    payment.created_at.isoformat(),
+                    payment.status,
+                ]
+            )
+
+        csv_content = si.getvalue()
+        response = Response(content=csv_content, media_type="text/csv")
+        response.headers["Content-Disposition"] = "attachment; filename=payments.csv"
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error exporting CSV: {e}")

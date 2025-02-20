@@ -15,4 +15,5 @@ A FastAPI-based application that integrates with Stripe to create and manage pay
   STRIPE_PUBLIC_KEY=<your_public_key>
   STRIPE_SECRET_KEY=<your_secret_key>
   ```
-
+## Run
+`uvicorn main:app --reload`

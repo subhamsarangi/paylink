@@ -17,7 +17,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, EmailStr, condecimal, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -60,7 +60,7 @@ class PaymentLink(Base):
     email = Column(String, index=True)
     amount = Column(Float)  # amount in dollars
     created_at = Column(DateTime, default=datetime.now)
-    status = Column(String, default="pending")  # pending, paid, expired
+    status = Column(String, default="pending")  # pending, paid, expired, cancelled
 
 
 Base.metadata.create_all(bind=engine)
@@ -147,7 +147,6 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 class PaymentLinkCreate(BaseModel):
     order_id: str
     email: EmailStr
-    # amount: condecimal(gt=0)
     amount: Annotated[Decimal, Field(gt=0)]
 
     @field_validator("order_id")
@@ -170,24 +169,66 @@ async def service_worker():
 @app.post("/create_payment_link")
 async def create_payment_link(data: PaymentLinkCreate, db: Session = Depends(get_db)):
     try:
-        token = uuid.uuid4().hex
-        with db.begin():
-            payment_link = PaymentLink(
-                token=token,
-                order_id=data.order_id,
-                email=data.email,
-                amount=float(data.amount),
-                created_at=datetime.now(),
-                status="pending",
+        payment_link = (
+            db.query(PaymentLink)
+            .filter(
+                PaymentLink.order_id == data.order_id,
+                PaymentLink.status.in_(("pending", "paid")),
             )
-            db.add(payment_link)
+            .first()
+        )
+        if payment_link:
+            if payment_link.status == "paid":
+                return JSONResponse(
+                    {
+                        "message": "Order has already been paid.",
+                        "status": "success",
+                    }
+                )
+            elif (
+                payment_link.status == "pending"
+                and (payment_link.created_at + timedelta(minutes=5)) > datetime.now()
+            ):
+                payment_url = f"{MY_DOMAIN}/pay/{payment_link.token}"
+                remaining = (
+                    payment_link.created_at + timedelta(minutes=5) - datetime.now()
+                )
+                return JSONResponse(
+                    {
+                        "payment_url": payment_url,
+                        "message": f"Pending payment link already exists. {remaining.seconds} seconds remaining.",
+                        "status": "success",
+                    }
+                )
+
+        token = uuid.uuid4().hex
+        payment_link = PaymentLink(
+            token=token,
+            order_id=data.order_id,
+            email=data.email,
+            amount=float(data.amount),
+            created_at=datetime.now(),
+            status="pending",
+        )
+        db.add(payment_link)
+        db.commit()
         db.refresh(payment_link)
         payment_url = f"{MY_DOMAIN}/pay/{payment_link.token}"
         logger.info(f"Payment link created: {payment_link.token}")
-        return {"payment_url": payment_url}
+        return JSONResponse(
+            {
+                "payment_url": payment_url,
+                "message": "Payment link created",
+                "status": "success",
+            }
+        )
     except Exception as e:
+        db.rollback()
         logger.exception("Error creating payment link.")
-        raise HTTPException(status_code=500, detail=f"Error creating payment link: {e}")
+        return JSONResponse(
+            {"content": f"Error creating payment link: {e}"},
+            status_code=500,
+        )
 
 
 @app.get("/pay/{token}", response_class=HTMLResponse)
@@ -195,9 +236,7 @@ async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
     try:
         payment_link = db.query(PaymentLink).filter(PaymentLink.token == token).first()
         if not payment_link:
-            return HTMLResponse(
-                content="<h3>Invalid payment link.</h3>", status_code=404
-            )
+            return JSONResponse({"content": "Invalid payment link"}, status_code=404)
 
         # Check expiration: If more than 5 minutes passed, mark as expired.
         if datetime.now() > payment_link.created_at + timedelta(minutes=5):
@@ -228,7 +267,10 @@ async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
         return templates.TemplateResponse("payment_page.html", context)
     except Exception as e:
         logger.exception("Error rendering payment page.")
-        return HTMLResponse(content=f"<h3>Error: {e}</h3>", status_code=500)
+        return JSONResponse(
+            {"content": f"Error rendering payment page: {e}"},
+            status_code=500,
+        )
 
 
 @app.post("/create_checkout_session")
@@ -272,8 +314,9 @@ async def create_checkout_session(
         return RedirectResponse(url=checkout_session.url, status_code=303)
     except Exception as e:
         logger.exception("Error creating checkout session.")
-        raise HTTPException(
-            status_code=500, detail=f"Error creating checkout session: {e}"
+        return JSONResponse(
+            {"content": f"Error creating checkout session: {e}"},
+            status_code=500,
         )
 
 
@@ -284,26 +327,25 @@ async def payment_success(
     try:
         payment_link = db.query(PaymentLink).filter(PaymentLink.token == token).first()
         if not payment_link:
-            return HTMLResponse(
-                content="<h3>Invalid payment link.</h3>", status_code=404
-            )
+            return JSONResponse({"content": "Invalid payment link"}, status_code=404)
         try:
             checkout_session = stripe.checkout.Session.retrieve(session_id)
         except Exception as stripe_error:
             logger.exception(f"Stripe error during session retrieval: {stripe_error}")
-            return HTMLResponse(
-                content="<h3>Error retrieving Stripe session.</h3>", status_code=500
+            return JSONResponse(
+                {"content": "Error retrieving Stripe session."}, status_code=500
             )
 
         if checkout_session.payment_status != "paid":
             logger.info(f"Stripe session not paid: {checkout_session.payment_status}")
-            return HTMLResponse(
-                content="<h3>Payment has not been completed.</h3>", status_code=400
+            return JSONResponse(
+                {"content": "Payment has not been completed."}, status_code=400
             )
+
         if checkout_session.metadata.get("payment_token") != token:
             logger.warning("Stripe session metadata does not match payment token.")
-            return HTMLResponse(
-                content="<h3>Session mismatch: Payment token does not match.</h3>",
+            return JSONResponse(
+                {"content": "Session mismatch: Payment token does not match."},
                 status_code=400,
             )
 
@@ -318,39 +360,33 @@ async def payment_success(
         )
     except Exception as e:
         logger.exception("Error in payment success endpoint.")
-        return HTMLResponse(content=f"<h3>Error: {e}</h3>", status_code=500)
+        return JSONResponse(
+            {"content": f"Error: {e}"},
+            status_code=500,
+        )
 
 
 @app.get("/payment_cancelled", response_class=HTMLResponse)
-async def payment_cancelled(request: Request, token: str):
-    return templates.TemplateResponse(
-        "payment_cancelled.html",
-        {"request": request, "message": "Payment was cancelled."},
-    )
-
-
-# cronjob
-@app.delete("/cleanup_expired")
-async def cleanup_expired(db: Session = Depends(get_db)):
+async def payment_cancelled(
+    request: Request, token: str, db: Session = Depends(get_db)
+):
     try:
-        expired_time = datetime.now() - timedelta(minutes=5)
-        expired_links = (
-            db.query(PaymentLink)
-            .filter(
-                PaymentLink.created_at < expired_time, PaymentLink.status == "pending"
+        payment_link = db.query(PaymentLink).filter(PaymentLink.token == token).first()
+        if not payment_link:
+            return HTMLResponse(
+                content="<h3>Invalid payment link.</h3>", status_code=404
             )
-            .all()
-        )
-        count = len(expired_links)
-        for link in expired_links:
-            link.status = "expired"
+        payment_link.status = "cancelled"
         db.commit()
-        logger.info(f"Cleaned up {count} expired payment links.")
-        return {"cleaned": count}
+        return templates.TemplateResponse(
+            "payment_cancelled.html",
+            {"request": request, "message": "Payment was cancelled."},
+        )
     except Exception as e:
-        logger.exception("Error cleaning up expired links.")
-        raise HTTPException(
-            status_code=500, detail=f"Error cleaning up expired links: {e}"
+        logger.exception("Error in payment cancelled endpoint.")
+        return JSONResponse(
+            {"content": f"Error: {e}"},
+            status_code=500,
         )
 
 
@@ -396,7 +432,10 @@ async def list_payments(
 
         return {"page": page, "per_page": per_page, "total": total, "data": results}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving payments: {e}")
+        return JSONResponse(
+            {"content": f"Error: {e}"},
+            status_code=500,
+        )
 
 
 @app.get("/payments/export")
@@ -445,4 +484,33 @@ async def export_payments_csv(
         response.headers["Content-Disposition"] = "attachment; filename=payments.csv"
         return response
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error exporting CSV: {e}")
+        return JSONResponse(
+            {"content": f"Error: {e}"},
+            status_code=500,
+        )
+
+
+# cronjob
+@app.delete("/cleanup_expired")
+async def cleanup_expired(db: Session = Depends(get_db)):
+    try:
+        expired_time = datetime.now() - timedelta(minutes=5)
+        expired_links = (
+            db.query(PaymentLink)
+            .filter(
+                PaymentLink.created_at < expired_time, PaymentLink.status == "pending"
+            )
+            .all()
+        )
+        count = len(expired_links)
+        for link in expired_links:
+            link.status = "expired"
+        db.commit()
+        logger.info(f"Cleaned up {count} expired payment links.")
+        return {"cleaned": count}
+    except Exception as e:
+        logger.exception("Error cleaning up expired links.")
+        return JSONResponse(
+            {"content": f"Error cleaning up: {e}"},
+            status_code=500,
+        )

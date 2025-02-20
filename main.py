@@ -3,29 +3,34 @@ import uuid
 import time
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Annotated
+from decimal import Decimal
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Form, Depends
-from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import (
+    Response,
+    RedirectResponse,
+    HTMLResponse,
+    FileResponse,
+    JSONResponse,
+)
 from fastapi.staticfiles import StaticFiles
-
-from pydantic import BaseModel, EmailStr, condecimal, field_validator
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, EmailStr, condecimal, Field, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
-from dotenv import load_dotenv
-
 import stripe
 
 # ---------------------------
-# Logging Configuration
+# Logging Setup
 # ---------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------
-# Environment & Stripe Setup
+# Environment Setup
 # ---------------------------
 load_dotenv()
 STRIPE_PUBLIC_KEY = os.getenv("STRIPE_PUBLIC_KEY")
@@ -38,15 +43,15 @@ stripe.api_key = STRIPE_SECRET_KEY
 MY_DOMAIN = "http://localhost:8000"
 
 # ---------------------------
-# Database Setup (SQLite)
+# Database Setup
 # ---------------------------
+
 DATABASE_URL = "sqlite:///./payments.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 
-# PaymentLink model
 class PaymentLink(Base):
     __tablename__ = "payment_links"
     id = Column(Integer, primary_key=True, index=True)
@@ -61,24 +66,7 @@ class PaymentLink(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# ---------------------------
-# Pydantic Model
-# ---------------------------
-class PaymentLinkCreate(BaseModel):
-    order_id: str
-    email: EmailStr
-    amount: condecimal(gt=0)
-
-    @field_validator("order_id")
-    def order_id_not_empty(cls, v):
-        if not v.strip():
-            raise ValueError("order_id cannot be empty")
-        return v
-
-
-# ---------------------------
 # Dependency to Get DB Session
-# ---------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -88,12 +76,11 @@ def get_db():
 
 
 # ---------------------------
-# FastAPI App & Middleware
+# FastAPI App Setuo
 # ---------------------------
 app = FastAPI()
 
 
-# Rate Limiting Middleware
 class RateLimitMiddleware:
     def __init__(self, app, rate_limit=10, time_window=60):
         self.app = app
@@ -123,9 +110,6 @@ class RateLimitMiddleware:
         await self.app(scope, receive, send)
 
 
-app.add_middleware(RateLimitMiddleware, rate_limit=10, time_window=60)
-
-
 class ContentSecurityPolicyMiddleware:
     def __init__(self, app):
         self.app = app
@@ -150,16 +134,27 @@ class ContentSecurityPolicyMiddleware:
         await self.app(scope, receive, send_wrapper)
 
 
+app.add_middleware(RateLimitMiddleware, rate_limit=10, time_window=60)
 app.add_middleware(ContentSecurityPolicyMiddleware)
 
-# Mount static files and provide a route for sw.js at the root.
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@app.get("/sw.js")
-async def service_worker():
-    return FileResponse("static/sw.js", media_type="application/javascript")
+# ---------------------------
+# Pydantic Model
+# ---------------------------
+class PaymentLinkCreate(BaseModel):
+    order_id: str
+    email: EmailStr
+    # amount: condecimal(gt=0)
+    amount: Annotated[Decimal, Field(gt=0)]
+
+    @field_validator("order_id")
+    def order_id_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("order_id cannot be empty")
+        return v
 
 
 # ---------------------------
@@ -167,7 +162,11 @@ async def service_worker():
 # ---------------------------
 
 
-# Create Payment Link with Transaction Handling
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse("static/sw.js", media_type="application/javascript")
+
+
 @app.post("/create_payment_link")
 async def create_payment_link(data: PaymentLinkCreate, db: Session = Depends(get_db)):
     try:
@@ -183,7 +182,7 @@ async def create_payment_link(data: PaymentLinkCreate, db: Session = Depends(get
             )
             db.add(payment_link)
         db.refresh(payment_link)
-        payment_url = f"/pay/{payment_link.token}"
+        payment_url = f"{MY_DOMAIN}/pay/{payment_link.token}"
         logger.info(f"Payment link created: {payment_link.token}")
         return {"payment_url": payment_url}
     except Exception as e:
@@ -191,7 +190,6 @@ async def create_payment_link(data: PaymentLinkCreate, db: Session = Depends(get
         raise HTTPException(status_code=500, detail=f"Error creating payment link: {e}")
 
 
-# Render Payment Page and Update Expired Status if Needed
 @app.get("/pay/{token}", response_class=HTMLResponse)
 async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
     try:
@@ -207,10 +205,6 @@ async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
                 payment_link.status = "expired"
                 db.commit()
                 logger.info(f"Payment link expired: {payment_link.token}")
-            return templates.TemplateResponse(
-                "expired.html",
-                {"request": request, "message": "This payment link has expired."},
-            )
 
         if payment_link.status == "paid":
             return templates.TemplateResponse(
@@ -237,7 +231,6 @@ async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
         return HTMLResponse(content=f"<h3>Error: {e}</h3>", status_code=500)
 
 
-# Create Stripe Checkout Session with Error Handling & Logging
 @app.post("/create_checkout_session")
 async def create_checkout_session(
     token: str = Form(...), db: Session = Depends(get_db)
@@ -266,9 +259,8 @@ async def create_checkout_session(
                 ],
                 mode="payment",
                 customer_email=payment_link.email,
-                success_url=MY_DOMAIN
-                + f"/payment_success?session_id={{CHECKOUT_SESSION_ID}}&token={payment_link.token}",
-                cancel_url=MY_DOMAIN + f"/payment_cancelled?token={payment_link.token}",
+                success_url=f"{MY_DOMAIN}/payment_success?session_id={{CHECKOUT_SESSION_ID}}&token={payment_link.token}",
+                cancel_url=f"{MY_DOMAIN}/payment_cancelled?token={payment_link.token}",
                 metadata={"payment_token": payment_link.token},
             )
         except Exception as stripe_error:
@@ -285,7 +277,6 @@ async def create_checkout_session(
         )
 
 
-# Payment Success: Verify Stripe Session and Update Status Accordingly
 @app.get("/payment_success", response_class=HTMLResponse)
 async def payment_success(
     request: Request, token: str, session_id: str, db: Session = Depends(get_db)
@@ -330,7 +321,6 @@ async def payment_success(
         return HTMLResponse(content=f"<h3>Error: {e}</h3>", status_code=500)
 
 
-# Payment Cancelled Endpoint
 @app.get("/payment_cancelled", response_class=HTMLResponse)
 async def payment_cancelled(request: Request, token: str):
     return templates.TemplateResponse(
@@ -339,7 +329,7 @@ async def payment_cancelled(request: Request, token: str):
     )
 
 
-# Optional: Endpoint to Cleanup Expired Payment Links
+# cronjob
 @app.delete("/cleanup_expired")
 async def cleanup_expired(db: Session = Depends(get_db)):
     try:

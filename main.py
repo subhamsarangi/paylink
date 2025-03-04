@@ -78,7 +78,12 @@ def get_db():
 # ---------------------------
 # FastAPI App Setuo
 # ---------------------------
-app = FastAPI()
+app = FastAPI(
+    title="Payment Links",
+    description="A simple payment link service using FastAPI and Stripe",
+    version="0.1.0",
+    docs_url="/",
+)
 
 
 class RateLimitMiddleware:
@@ -161,7 +166,7 @@ class PaymentLinkCreate(BaseModel):
 # ---------------------------
 
 
-@app.get("/sw.js")
+@app.get("/sw.js", include_in_schema=False)
 async def service_worker():
     return FileResponse("static/sw.js", media_type="application/javascript")
 
@@ -231,7 +236,7 @@ async def create_payment_link(data: PaymentLinkCreate, db: Session = Depends(get
         )
 
 
-@app.get("/pay/{token}", response_class=HTMLResponse)
+@app.get("/pay/{token}", response_class=HTMLResponse, include_in_schema=False)
 async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
     try:
         payment_link = db.query(PaymentLink).filter(PaymentLink.token == token).first()
@@ -273,7 +278,7 @@ async def pay_page(request: Request, token: str, db: Session = Depends(get_db)):
         )
 
 
-@app.post("/create_checkout_session")
+@app.post("/create_checkout_session", include_in_schema=False)
 async def create_checkout_session(
     token: str = Form(...), db: Session = Depends(get_db)
 ):
@@ -320,7 +325,7 @@ async def create_checkout_session(
         )
 
 
-@app.get("/payment_success", response_class=HTMLResponse)
+@app.get("/payment_success", response_class=HTMLResponse, include_in_schema=False)
 async def payment_success(
     request: Request, token: str, session_id: str, db: Session = Depends(get_db)
 ):
@@ -366,7 +371,7 @@ async def payment_success(
         )
 
 
-@app.get("/payment_cancelled", response_class=HTMLResponse)
+@app.get("/payment_cancelled", response_class=HTMLResponse, include_in_schema=False)
 async def payment_cancelled(
     request: Request, token: str, db: Session = Depends(get_db)
 ):
